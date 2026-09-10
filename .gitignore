@@ -1,0 +1,4 @@
+.env
+/env
+/src/columnas_entrenamiento.pkl
+/src/modelo_xgboost.pkl
