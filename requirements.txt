@@ -1,0 +1,7 @@
+pandas
+sqlalchemy
+pyodbc
+python-dotenv
+scikit-learn
+xgboost
+holidays
