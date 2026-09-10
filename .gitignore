@@ -1,4 +1,11 @@
+# Entorno virtual y credenciales
 .env
-/env
-/src/columnas_entrenamiento.pkl
-/src/modelo_xgboost.pkl
+/env/
+
+# Archivos de Machine Learning generados (binarios pesados)
+src/*.pkl
+
+# Caché de Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
