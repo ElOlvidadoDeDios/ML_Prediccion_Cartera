@@ -39,7 +39,7 @@ def obtener_nombre_legible(feature_name):
 
 
 def predecir_manana():
-    logging.info("🔮 Iniciando Predicción Explicable (Corregida)...")
+    logging.info("🔮 Iniciando Predicción Explicable (Con Reglas de Negocio V2)...")
 
     try:
         with open("src/modelo_ops.pkl", "rb") as f:
@@ -62,6 +62,7 @@ def predecir_manana():
         if fecha_env
         else pd.to_datetime(datetime.now().date())
     )
+
     logging.info(
         f"📅 GENERANDO PREDICCIONES PARA EL DÍA: {fecha_objetivo.strftime('%Y-%m-%d')}"
     )
@@ -88,11 +89,9 @@ def predecir_manana():
     )
     df_ultimo["EsDomingo"] = (df_ultimo["DiaSemana"] == 6).astype(int)
 
-    # 🔥 EL EXORCISMO DEL EFECTO FANTASMA 🔥
-    # Calculamos cuántos días han pasado desde la última vez que este producto se vendió.
+    # EL EXORCISMO DEL EFECTO FANTASMA
     dias_desfase = (fecha_objetivo - df_ultimo["Fecha"]).dt.days
 
-    # Si la fila es vieja, sus solicitudes pasadas YA NO EXISTEN HOY. Todo a CERO.
     df_ultimo["Monto_Ayer"] = np.where(
         dias_desfase == 1, df_ultimo["ColocacionMontoReal"], 0
     )
@@ -112,7 +111,6 @@ def predecir_manana():
     df_ultimo["Monto_Solicitado_21d"] = np.where(
         dias_desfase <= 21, df_ultimo["Monto_Solicitado_21d"], 0
     )
-
     df_ultimo["Aceleracion_Semanal"] = np.where(
         dias_desfase <= 7, df_ultimo["Aceleracion_Semanal"], 0
     )
@@ -122,27 +120,22 @@ def predecir_manana():
     )
     X_pred = X_pred_raw.reindex(columns=columnas_modelo, fill_value=0)
 
-    # 🔥 MAGIA RESTAURADA 🔥
-    # Redondeamos las operaciones para evitar que la IA desembolse "0.2 créditos"
-    # Usamos la esperanza matemática exacta, sin redondear a cero.
+    # ESPERANZA MATEMÁTICA REAL
     prediccion_operaciones = np.clip(modelo_ops.predict(X_pred), 0, None)
     ticket_ancla = df_ultimo["Ticket_Promedio_30d"]
 
     # === TUS REGLAS DE NEGOCIO ===
     factor_estacional = np.ones(len(df_ultimo))
 
-    # 1. Sábados (Medio día de trabajo -> castigamos la capacidad al 60%)
-    factor_estacional = np.where(df_ultimo["DiaSemana"] == 5, 0.60, factor_estacional)
-
-    # 2. Cierre de mes (Horario extendido hasta 8pm -> bonificación del 35%)
+    # Cierre de mes: Trabajan hasta las 8 PM (2 horas extra = ~25% más de capacidad + fiebre comercial)
     factor_estacional = np.where(
         df_ultimo["Fiebre_Cierre"] == 1, factor_estacional * 1.35, factor_estacional
     )
 
-    # Multiplicamos: Probabilidad * Ticket * Multiplicador de Horario
+    # Cálculo base
     predicciones_dinero = prediccion_operaciones * ticket_ancla * factor_estacional
 
-    # 3. Domingos NO SE TRABAJA (Filtro absoluto a CERO)
+    # Domingos NO SE TRABAJA (Cero rotundo)
     predicciones_dinero = np.where(df_ultimo["EsDomingo"] == 1, 0, predicciones_dinero)
 
     logging.info("🧠 Generando explicaciones de la IA para Gerencia...")
@@ -186,7 +179,6 @@ def predecir_manana():
         )
 
         for _, row in resultados.iterrows():
-            # Solo guardamos productos que tengan predicción > 0 para no ensuciar la BD
             if row["Prediccion_Diaria"] > 0:
                 cursor.execute(
                     """
@@ -215,7 +207,6 @@ def predecir_manana():
 
         print("\n--- PREDICCIÓN EXPLICADA Y CONSOLIDADA ---")
         print(resumen_consola[["IdSAgencia", columna_dinamica]].to_string(index=False))
-
         logging.info("✅ ¡Proyección Explicada guardada en SQL con éxito!")
     except Exception as e:
         logging.error(f"❌ Error al guardar en SQL: {e}")

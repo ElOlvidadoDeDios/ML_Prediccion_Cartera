@@ -28,16 +28,11 @@ def obtener_datos_raw():
 
 
 def construir_features():
-    logging.info("🚀 Construcción de Features (Inyectando calendario de ceros)...")
+    logging.info("🚀 Construcción de Features (Tickets Reales + Grilla de Ceros)...")
     df = obtener_datos_raw()
     df["Fecha"] = pd.to_datetime(df["Fecha"])
 
-    # =========================================================================
-    # 🔥 LA CURA: LA GRILLA CONTINUA DE TIEMPO 🔥
-    # Forzamos la creación de todos los días del calendario para cada producto.
-    # Así evitamos que el shift() "viaje en el tiempo" robando ventas de meses pasados.
-    # =========================================================================
-
+    # LA GRILLA CONTINUA DE TIEMPO (Inyectamos los ceros)
     rango_fechas = pd.date_range(
         start=df["Fecha"].min(), end=df["Fecha"].max(), freq="D"
     )
@@ -45,21 +40,18 @@ def construir_features():
         ["IdSAgencia", "IdTipoProducto", "NombreProducto"]
     ].drop_duplicates()
 
-    # Creamos el esqueleto con todos los días cruzados con todas las agencias y productos
     grid = (
         combinaciones.assign(key=1)
         .merge(pd.DataFrame({"Fecha": rango_fechas, "key": 1}), on="key")
         .drop("key", axis=1)
     )
 
-    # Rescatamos los feriados antes de hacer el cruce para no perderlos
     fechas_df = (
         df[["Fecha", "EsFeriadoNacional", "EsFiestaLocal"]]
         .drop_duplicates(subset=["Fecha"])
         .dropna()
     )
 
-    # Unimos la data real al esqueleto. Los días sin venta quedarán vacíos (NaN)
     df = pd.merge(
         grid,
         df.drop(columns=["EsFeriadoNacional", "EsFiestaLocal", "NombreProducto"]),
@@ -68,7 +60,6 @@ def construir_features():
     )
     df = pd.merge(df, fechas_df, on="Fecha", how="left")
 
-    # Todo lo vacío significa "Nadie entró a la agencia a pedir/pagar este producto" -> CERO.
     df["EsFeriadoNacional"] = df["EsFeriadoNacional"].fillna(0)
     df["EsFiestaLocal"] = df["EsFiestaLocal"].fillna(0)
 
@@ -83,12 +74,9 @@ def construir_features():
         if col in df.columns:
             df[col] = df[col].fillna(0)
 
-    # Ordenar vital para que el shift() funcione cronológicamente
     df = df.sort_values(by=["IdSAgencia", "IdTipoProducto", "Fecha"]).reset_index(
         drop=True
     )
-
-    # =========================================================================
 
     # 1. Calendario y Estacionalidad
     df["DiaSemana"] = df["Fecha"].dt.dayofweek
@@ -103,34 +91,39 @@ def construir_features():
 
     # 2. Desfases POR PRODUCTO Y AGENCIA
     grupo_prod = df.groupby(["IdSAgencia", "IdTipoProducto"])
-
     df["Monto_Ayer"] = grupo_prod["ColocacionMontoReal"].shift(1).fillna(0)
     df["Ops_Ayer"] = grupo_prod["ColocacionNumReal"].shift(1).fillna(0)
     df["Monto_Hace_7d"] = grupo_prod["ColocacionMontoReal"].shift(7).fillna(0)
     df["Monto_Hace_14d"] = grupo_prod["ColocacionMontoReal"].shift(14).fillna(0)
-
     df["Aceleracion_Semanal"] = df["Monto_Ayer"] - df["Monto_Hace_7d"]
 
-    # Ticket Promedio Histórico POR PRODUCTO
-    df["LineaBase_30d"] = (
-        grupo_prod["ColocacionMontoReal"]
-        .transform(lambda x: x.shift(1).rolling(30, min_periods=1).mean())
-        .fillna(0)
-    )
-    df["Media_Ops_30d"] = (
-        grupo_prod["ColocacionNumReal"]
-        .transform(lambda x: x.shift(1).rolling(30, min_periods=1).mean())
-        .fillna(0)
+    # 🔥 CORRECCIÓN DEL TICKET PROMEDIO 🔥 (Solo promedia los días con ventas reales)
+    df_ventas = df[df["ColocacionNumReal"] > 0].copy()
+    df_ventas["Ticket_Diario"] = (
+        df_ventas["ColocacionMontoReal"] / df_ventas["ColocacionNumReal"]
     )
 
-    df["Ticket_Promedio_30d"] = np.where(
-        df["Media_Ops_30d"] > 0, df["LineaBase_30d"] / df["Media_Ops_30d"], 2000
+    grupo_ventas = df_ventas.groupby(["IdSAgencia", "IdTipoProducto"])
+    df_ventas["Ticket_Promedio_Real"] = grupo_ventas["Ticket_Diario"].transform(
+        lambda x: x.shift(1).rolling(15, min_periods=1).mean()
     )
+
+    df = pd.merge(
+        df,
+        df_ventas[["IdSAgencia", "IdTipoProducto", "Fecha", "Ticket_Promedio_Real"]],
+        on=["IdSAgencia", "IdTipoProducto", "Fecha"],
+        how="left",
+    )
+
+    df["Ticket_Promedio_30d"] = df.groupby(["IdSAgencia", "IdTipoProducto"])[
+        "Ticket_Promedio_Real"
+    ].ffill()
+    df["Ticket_Promedio_30d"] = df["Ticket_Promedio_30d"].fillna(3000)
+    df = df.drop(columns=["Ticket_Promedio_Real"])
 
     # 3. Contexto General de la Agencia (Presión comercial y Fondeo)
     grupo_age = df.groupby(["IdSAgencia"])
 
-    # El embudo SÍ usa grupo_prod (porque es solicitud del producto)
     df["Bolsa_En_Evaluacion_3d"] = (
         grupo_prod["MontoSolicitado"]
         .transform(lambda x: x.shift(1).rolling(3, min_periods=1).sum())
@@ -152,7 +145,6 @@ def construir_features():
         .fillna(0)
     )
 
-    # El fondeo SÍ usa grupo_age (caja común de la agencia)
     df["Repago_Ayer"] = grupo_age["RepagoReal"].shift(1).fillna(0)
     df["Repago_Semana_Pasada"] = (
         grupo_age["RepagoReal"]
@@ -160,7 +152,7 @@ def construir_features():
         .fillna(0)
     )
 
-    # 4. Limpieza final de variables que causan Fuga de Datos
+    # 4. Limpieza final
     columnas_futuras = [
         "NombreProducto",
         "PlazoPromedioMeses",
@@ -175,9 +167,8 @@ def construir_features():
         "Media_Ops_30d",
         "ColocacionesMicro",
         "ColocacionesMacro",
+        "LineaBase_30d",
     ]
-
-    # ATENCIÓN: Eliminé el .dropna() porque borraba los días vacíos arruinando la grilla.
     df = df.drop(columns=columnas_futuras, errors="ignore").fillna(0)
 
     df.to_csv("src/dataset_procesado.csv", index=False)
