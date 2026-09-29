@@ -1,182 +1,186 @@
+# src/03_daily_predict.py
+
 import pandas as pd
-import joblib
+import xgboost as xgb
+import pickle
 import logging
+import pyodbc
+import sys
 import os
-import holidays
-from datetime import timedelta
-from config import get_engine
+import shap
+import numpy as np
+from datetime import datetime
+from config import STR_CONN_DESTINO
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
+TRADUCTOR_VARIABLES = {
+    "Fiebre_Cierre": "Presión Cierre de Mes",
+    "EsQuincena": "Efecto Quincena",
+    "Bolsa_En_Evaluacion_3d": "Solicitudes en Trámite",
+    "Monto_Ayer": "Colocación del Día Anterior",
+    "Ticket_Promedio_30d": "Ticket Histórico del Producto",
+    "EsDomingo": "Día No Laborable (Domingo)",
+    "EsFeriadoNacional": "Feriado Nacional",
+    "EsFiestaLocal": "Festividad Local",
+    "Aceleracion_Semanal": "Racha Comercial Semanal",
+}
 
-def run_daily_prediction():
-    logging.info("🔮 Iniciando Predicción Diaria V6 (Nivel Agencia)...")
-    engine = get_engine()
 
-    df_max = pd.read_sql(
-        "SELECT MAX(Fecha) as UltimaFecha FROM ml.fct_historico_colocacion", engine
+def obtener_nombre_legible(feature_name):
+    for key, value in TRADUCTOR_VARIABLES.items():
+        if key in feature_name:
+            return value
+    if "IdTipoProducto_" in feature_name:
+        return "Naturaleza del Producto"
+    if "IdSAgencia_" in feature_name:
+        return "Historial de la Agencia"
+    return feature_name
+
+
+def predecir_manana():
+    logging.info("🔮 Iniciando Predicción Explicable (Redondeada a la Realidad)...")
+
+    try:
+        with open("src/modelo_ops.pkl", "rb") as f:
+            modelo_ops = pickle.load(f)
+        with open("src/columnas_entrenamiento.pkl", "rb") as f:
+            columnas_modelo = pickle.load(f)
+    except FileNotFoundError:
+        logging.error("❌ Faltan archivos .pkl.")
+        sys.exit(1)
+
+    df = pd.read_csv(
+        "src/dataset_procesado.csv", dtype={"IdSAgencia": str, "IdTipoProducto": str}
     )
-    ultima_fecha = pd.to_datetime(df_max["UltimaFecha"].iloc[0]).date()
-    dia_a_predecir = ultima_fecha + timedelta(days=1)
+    df["IdSAgencia"] = df["IdSAgencia"].apply(lambda x: str(x).zfill(2))
+    df["Fecha"] = pd.to_datetime(df["Fecha"])
 
-    query_hist = f"SELECT * FROM ml.fct_historico_colocacion WHERE Fecha >= DATEADD(day, -45, '{ultima_fecha}')"
-    df_hist = pd.read_sql(query_hist, engine)
-    df_hist["Fecha"] = pd.to_datetime(df_hist["Fecha"]).dt.date
+    fecha_env = os.getenv("FECHA_PREDICCION")
+    fecha_objetivo = (
+        pd.to_datetime(fecha_env)
+        if fecha_env
+        else pd.to_datetime(datetime.now().date())
+    )
 
-    # 1. Agrupar la historia al nivel Agencia
-    col_agrup_hist = ["Fecha", "IdSAgencia"]
-    df_hist = (
-        df_hist.groupby(col_agrup_hist)
-        .agg(
-            {
-                "ColocacionMontoReal": "sum",
-                "AnalistasActivos": "max",
-                "ExperienciaPromedioMeses": "mean",
-                "ColocacionesMicro": "sum",
-                "ColocacionesMacro": "sum",
-            }
+    idx_ultimos = df.groupby(["IdSAgencia", "IdTipoProducto"])["Fecha"].idxmax()
+    df_ultimo = df.loc[idx_ultimos].copy()
+
+    df_ultimo["Fecha_Prediccion"] = fecha_objetivo
+    df_ultimo["DiaSemana"] = df_ultimo["Fecha_Prediccion"].dt.dayofweek
+    df_ultimo["MesDelAnio"] = df_ultimo["Fecha_Prediccion"].dt.month
+    df_ultimo["DiaDelMes"] = df_ultimo["Fecha_Prediccion"].dt.day
+    df_ultimo["EsFinDeMes"] = df_ultimo["Fecha_Prediccion"].dt.is_month_end.astype(int)
+    df_ultimo["DiasParaFinMes"] = (
+        df_ultimo["Fecha_Prediccion"].dt.days_in_month - df_ultimo["DiaDelMes"]
+    )
+    df_ultimo["Fiebre_Cierre"] = df_ultimo["DiasParaFinMes"].apply(
+        lambda x: 1 if x <= 5 else 0
+    )
+    df_ultimo["EsQuincena"] = df_ultimo["DiaDelMes"].apply(
+        lambda x: 1 if x in [14, 15, 16] else 0
+    )
+    df_ultimo["EsPrincipioMes"] = df_ultimo["DiaDelMes"].apply(
+        lambda x: 1 if x <= 7 else 0
+    )
+    df_ultimo["EsDomingo"] = (df_ultimo["DiaSemana"] == 6).astype(int)
+
+    df_ultimo["Monto_Ayer"] = df_ultimo["ColocacionMontoReal"]
+    df_ultimo["Ops_Ayer"] = df_ultimo["ColocacionNumReal"]
+
+    X_pred_raw = pd.get_dummies(
+        df_ultimo, columns=["IdSAgencia", "IdTipoProducto", "MesDelAnio", "DiaSemana"]
+    )
+    X_pred = X_pred_raw.reindex(columns=columnas_modelo, fill_value=0)
+
+    # 🔥 LA MAGIA ESTÁ AQUÍ: np.round() 🔥
+    # Redondeamos las operaciones. Si la IA dice 0.4 créditos de Hipotecario, se vuelve 0.
+    # Así matamos los "montos fantasma".
+    prediccion_operaciones = np.round(np.clip(modelo_ops.predict(X_pred), 0, None))
+
+    ticket_ancla = df_ultimo["Ticket_Promedio_30d"]
+    factor_estacional = np.where(
+        (df_ultimo["Fiebre_Cierre"] == 1) | (df_ultimo["EsQuincena"] == 1), 1.15, 1.0
+    )
+
+    # Solo habrá dinero si las operaciones redondeadas son 1, 2, 3...
+    predicciones_dinero = prediccion_operaciones * (ticket_ancla * factor_estacional)
+
+    logging.info("🧠 Generando explicaciones de la IA para Gerencia...")
+    explainer = shap.TreeExplainer(modelo_ops)
+    shap_values = explainer.shap_values(X_pred)
+
+    motivos_positivos = []
+    motivos_negativos = []
+
+    for i in range(len(X_pred)):
+        idx_max = np.argmax(shap_values[i])
+        idx_min = np.argmin(shap_values[i])
+        motivos_positivos.append(
+            f"Impulsado por: {obtener_nombre_legible(columnas_modelo[idx_max])}"
         )
-        .reset_index()
-    )
+        motivos_negativos.append(
+            f"Frenado por: {obtener_nombre_legible(columnas_modelo[idx_min])}"
+        )
 
-    # 2. Generar el día de hoy (1 fila por agencia)
-    agencias = df_hist[["IdSAgencia"]].drop_duplicates()
-    df_hoy = agencias.copy()
-    df_hoy["Fecha"] = dia_a_predecir
-    for col in [
-        "ColocacionMontoReal",
-        "AnalistasActivos",
-        "ExperienciaPromedioMeses",
-        "ColocacionesMicro",
-        "ColocacionesMacro",
-    ]:
-        df_hoy[col] = 0
-
-    df_full = pd.concat([df_hist, df_hoy], ignore_index=True)
-    df_full["Fecha"] = pd.to_datetime(df_full["Fecha"])
-
-    # Calendario y Festividades
-    df_full["Anio"] = df_full["Fecha"].dt.year
-    df_full["Mes"] = df_full["Fecha"].dt.month
-    df_full["Dia"] = df_full["Fecha"].dt.day
-    df_full["DiaSemana"] = df_full["Fecha"].dt.dayofweek
-    df_full["EsQuincena"] = df_full["Dia"].apply(lambda x: 1 if x in [15, 16] else 0)
-    df_full["EsFinDeMes"] = df_full["Fecha"].dt.is_month_end.astype(int)
-
-    pe_holidays = holidays.PE(years=df_full["Anio"].unique().tolist())
-    df_full["EsFeriadoNacional"] = df_full["Fecha"].apply(
-        lambda x: 1 if x in pe_holidays else 0
-    )
-
-    def es_fiesta_cusco(fecha):
-        festividades_cusco = {
-            (1, 6),
-            (1, 20),
-            (2, 5),
-            (2, 12),
-            (2, 15),
-            (3, 27),
-            (3, 29),
-            (3, 30),
-            (4, 1),
-            (4, 2),
-            (4, 3),
-            (4, 4),
-            (4, 5),
-            (5, 2),
-            (5, 3),
-            (5, 24),
-            (5, 31),
-            (6, 1),
-            (6, 3),
-            (6, 4),
-            (6, 9),
-            (6, 10),
-            (6, 11),
-            (6, 12),
-            (6, 13),
-            (6, 14),
-            (6, 15),
-            (6, 16),
-            (6, 19),
-            (6, 21),
-            (6, 24),
-            (7, 15),
-            (7, 16),
-            (7, 17),
-            (7, 18),
-            (8, 1),
-            (8, 2),
-            (8, 15),
-            (8, 24),
-            (8, 30),
-            (9, 8),
-            (9, 14),
-            (9, 30),
-            (10, 18),
-            (10, 31),
-            (11, 1),
-            (11, 2),
-            (12, 22),
-            (12, 23),
-            (12, 24),
-            (12, 31),
+    resultados = pd.DataFrame(
+        {
+            "Fecha": df_ultimo["Fecha_Prediccion"],
+            "IdSAgencia": df_ultimo["IdSAgencia"],
+            "IdTipoProducto": df_ultimo["IdTipoProducto"],
+            "Prediccion_Diaria": predicciones_dinero,
+            "Motivo_Positivo": motivos_positivos,
+            "Motivo_Negativo": motivos_negativos,
         }
-        return 1 if (fecha.month, fecha.day) in festividades_cusco else 0
-
-    df_full["EsFiestaLocal"] = df_full["Fecha"].apply(es_fiesta_cusco)
-
-    df_full = df_full.sort_values(by=["IdSAgencia", "Fecha"])
-
-    # Línea base y Lags Operativos
-    df_full["LineaBase_30d"] = df_full.groupby("IdSAgencia")[
-        "ColocacionMontoReal"
-    ].transform(lambda x: x.shift(1).rolling(window=21, min_periods=1).mean())
-    df_full["Monto_Ayer"] = df_full.groupby("IdSAgencia")["ColocacionMontoReal"].shift(
-        1
-    )
-    df_full["Tendencia_7_Dias"] = df_full.groupby("IdSAgencia")[
-        "ColocacionMontoReal"
-    ].transform(lambda x: x.shift(1).rolling(window=7, min_periods=1).mean())
-    df_full["Analistas_Ayer"] = df_full.groupby("IdSAgencia")["AnalistasActivos"].shift(
-        1
-    )
-    df_full["Experiencia_Ayer"] = df_full.groupby("IdSAgencia")[
-        "ExperienciaPromedioMeses"
-    ].shift(1)
-    df_full.fillna(0, inplace=True)
-
-    # Filtrar hoy
-    df_pred = df_full[df_full["Fecha"].dt.date == dia_a_predecir].copy()
-    df_ml = pd.get_dummies(df_pred, columns=["IdSAgencia"])
-
-    modelo = joblib.load(os.path.join(os.path.dirname(__file__), "modelo_xgboost.pkl"))
-    columnas_entrenamiento = joblib.load(
-        os.path.join(os.path.dirname(__file__), "columnas_entrenamiento.pkl")
     )
 
-    for col in columnas_entrenamiento:
-        if col not in df_ml.columns:
-            df_ml[col] = 0
+    try:
+        conn = pyodbc.connect(STR_CONN_DESTINO)
+        cursor = conn.cursor()
+        fecha_str = fecha_objetivo.strftime("%Y-%m-%d")
 
-    X_pred = df_ml[columnas_entrenamiento]
-    ratio_predicho = modelo.predict(X_pred)
+        logging.info(
+            f"🧹 Purgando proyecciones previas del {fecha_str} para evitar duplicidad..."
+        )
+        cursor.execute(
+            f"DELETE FROM [ml].[fct_predicciones_diarias] WHERE CAST(Fecha AS DATE) = CAST('{fecha_str}' AS DATE)"
+        )
 
-    # Guardar resultados
-    df_final = df_pred[["Fecha", "IdSAgencia"]].copy()
-    df_final["IdTipoProducto"] = "00"  # Código Genérico de Agencia Total
-    df_final["MontoPredicho"] = df_pred["LineaBase_30d"] * ratio_predicho
-    df_final["MontoPredicho"] = df_final["MontoPredicho"].apply(
-        lambda x: round(x, 2) if x > 0 else 0
-    )
+        for _, row in resultados.iterrows():
+            # Solo guardamos productos que tengan predicción > 0 para no ensuciar la BD
+            if row["Prediccion_Diaria"] > 0:
+                cursor.execute(
+                    """
+                    INSERT INTO [ml].[fct_predicciones_diarias] 
+                    (Fecha, IdSAgencia, IdTipoProducto, MontoPredicho, MotivoImpulsor, MotivoFreno)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                    row["Fecha"],
+                    row["IdSAgencia"],
+                    row["IdTipoProducto"],
+                    row["Prediccion_Diaria"],
+                    row["Motivo_Positivo"],
+                    row["Motivo_Negativo"],
+                )
 
-    tabla_destino = "fct_predicciones_diarias"
-    df_final.to_sql(
-        name=tabla_destino, schema="ml", con=engine, if_exists="append", index=False
-    )
-    engine.dispose()
-    logging.info("✅ ¡Predicción Diaria completada con éxito!")
+        conn.commit()
+        conn.close()
+
+        resumen_consola = (
+            resultados.groupby("IdSAgencia")["Prediccion_Diaria"].sum().reset_index()
+        )
+        resumen_consola["Predicción de HOY"] = resumen_consola[
+            "Prediccion_Diaria"
+        ].apply(lambda x: f"S/ {x:,.2f}")
+        print("\n--- PREDICCIÓN EXPLICADA Y CONSOLIDADA (REDONDEADA) ---")
+        print(
+            resumen_consola[["IdSAgencia", "Predicción de HOY"]].to_string(index=False)
+        )
+
+        logging.info("✅ ¡Proyección Explicada guardada en SQL con éxito!")
+    except Exception as e:
+        logging.error(f"❌ Error al guardar en SQL: {e}")
 
 
 if __name__ == "__main__":
-    run_daily_prediction()
+    predecir_manana()

@@ -1,138 +1,105 @@
-import pandas as pd
-import holidays
-import logging
-from config import get_engine
+# src/01_bulid_features.py
 
+import pandas as pd
+import pyodbc
+import logging
+import warnings
+import numpy as np
+from config import STR_CONN_DESTINO
+
+warnings.filterwarnings("ignore", category=UserWarning)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 
-def fabricar_features_temporales(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # 1. Asegurar que la fecha sea tipo datetime
-    df["Fecha"] = pd.to_datetime(df["Fecha"])
-
-    # 2. Variables Básicas de Tiempo
-    df["Anio"] = df["Fecha"].dt.year
-    df["Mes"] = df["Fecha"].dt.month
-    df["Dia"] = df["Fecha"].dt.day
-    df["DiaSemana"] = df["Fecha"].dt.dayofweek  # 0=Lunes, 6=Domingo
-
-    # 3. Variables de Negocio (Quincenas y Fin de mes)
-    df["EsQuincena"] = df["Dia"].apply(lambda x: 1 if x in [15, 16] else 0)
-    df["EsFinDeMes"] = df["Fecha"].dt.is_month_end.astype(int)
-
-    # 4. Feriados Nacionales (Perú)
-    pe_holidays = holidays.PE(years=df["Anio"].unique().tolist())
-    df["EsFeriadoNacional"] = df["Fecha"].apply(lambda x: 1 if x in pe_holidays else 0)
-
-    # 5. Festividades Locales (Cusco)
-    # Aquí mapeamos fechas clave que impactan el comercio local
-    def es_fiesta_cusco(fecha):
-        # Mapeo del calendario festivo de Cusco (Mes, Día)
-        festividades_cusco = {
-            # Enero
-            (1, 6),
-            (1, 20),
-            # Febrero (Carnavales - Fechas referenciales)
-            (2, 5),
-            (2, 12),
-            (2, 15),
-            # Marzo y Abril (Lanzamiento Inti Raymi y Semana Santa)
-            (3, 27),
-            (3, 29),
-            (3, 30),
-            (4, 1),
-            (4, 2),
-            (4, 3),
-            (4, 4),
-            (4, 5),
-            # Mayo (Cruces)
-            (5, 2),
-            (5, 3),
-            (5, 24),
-            (5, 31),
-            # Junio (Mes Jubilar - Impacto masivo en operaciones)
-            (6, 1),
-            (6, 3),
-            (6, 4),
-            (6, 9),
-            (6, 10),
-            (6, 11),
-            (6, 12),
-            (6, 13),
-            (6, 14),
-            (6, 15),
-            (6, 16),
-            (6, 19),
-            (6, 21),
-            (6, 24),
-            # Julio (Virgen del Carmen)
-            (7, 15),
-            (7, 16),
-            (7, 17),
-            (7, 18),
-            # Agosto (Pachamama y Santos)
-            (8, 1),
-            (8, 2),
-            (8, 15),
-            (8, 24),
-            (8, 30),
-            # Septiembre (¡El freno de hoy!)
-            (9, 8),
-            (9, 14),
-            (9, 30),
-            # Octubre
-            (10, 18),
-            (10, 31),
-            # Noviembre
-            (11, 1),
-            (11, 2),
-            # Diciembre (Santurantikuy)
-            (12, 22),
-            (12, 23),
-            (12, 24),
-            (12, 31),
-        }
-
-        # Si la fecha coincide con una festividad cusqueña, marcamos 1
-        if (fecha.month, fecha.day) in festividades_cusco:
-            return 1
-        return 0
-
-    df["EsFiestaLocal"] = df["Fecha"].apply(es_fiesta_cusco)
-
+def obtener_datos_raw():
+    conn = pyodbc.connect(STR_CONN_DESTINO)
+    # 🔥 FASE ENTERPRISE: Unimos el Histórico con tus Features de DWH
+    query = """
+        SELECT 
+            h.*, 
+            ISNULL(f.EsFeriadoNacional, 0) AS EsFeriadoNacional, 
+            ISNULL(f.EsFiestaLocal, 0) AS EsFiestaLocal
+        FROM [ml].[fct_historico_colocacion] h
+        LEFT JOIN [ml].[fct_features_entrenamiento] f 
+            ON h.Fecha = f.Fecha AND h.IdSAgencia = f.IdSAgencia
+    """
+    df = pd.read_sql(query, conn)
+    conn.close()
     return df
 
 
-def run_feature_engineering():
-    logging.info("🚀 Iniciando Construcción de Features...")
-    engine = get_engine()
+def construir_features():
+    logging.info("🚀 Construcción de Features (Nivel Producto & Feriados SQL)...")
+    df = obtener_datos_raw()
+    df["Fecha"] = pd.to_datetime(df["Fecha"])
 
-    # 1. Leer el histórico crudo
-    query = "SELECT * FROM ml.fct_historico_colocacion"
-    logging.info("📖 Leyendo datos históricos desde SQL Server...")
-    df_raw = pd.read_sql(query, engine)
-
-    # 2. Fabricar las columnas de contexto
-    logging.info(
-        "⚙️ Procesando el calendario inteligente (Feriados, Quincenas, Cusco)..."
-    )
-    df_features = fabricar_features_temporales(df_raw)
-
-    # 3. Guardar la matriz final en la base de datos
-    tabla_destino = "fct_features_entrenamiento"
-    logging.info(f"💾 Guardando matriz de entrenamiento en ml.{tabla_destino}...")
-
-    df_features.to_sql(
-        name=tabla_destino, schema="ml", con=engine, if_exists="replace", index=False
+    # Ya no agrupamos y aplastamos. Solo ordenamos por Agencia y Producto.
+    df = df.sort_values(by=["IdSAgencia", "IdTipoProducto", "Fecha"]).reset_index(
+        drop=True
     )
 
-    engine.dispose()
-    logging.info(
-        f"✅ ¡Éxito! Se procesaron {len(df_features)} registros listos para Machine Learning."
+    # 1. Calendario y Estacionalidad
+    df["DiaSemana"] = df["Fecha"].dt.dayofweek
+    df["MesDelAnio"] = df["Fecha"].dt.month
+    df["DiaDelMes"] = df["Fecha"].dt.day
+    df["EsFinDeMes"] = df["Fecha"].dt.is_month_end.astype(int)
+    df["DiasParaFinMes"] = df["Fecha"].dt.days_in_month - df["DiaDelMes"]
+    df["Fiebre_Cierre"] = df["DiasParaFinMes"].apply(lambda x: 1 if x <= 5 else 0)
+    df["EsQuincena"] = df["DiaDelMes"].apply(lambda x: 1 if x in [14, 15, 16] else 0)
+    df["EsPrincipioMes"] = df["DiaDelMes"].apply(lambda x: 1 if x <= 7 else 0)
+    df["EsDomingo"] = (df["DiaSemana"] == 6).astype(int)
+
+    # 2. Desfases POR PRODUCTO Y AGENCIA
+    grupo_prod = df.groupby(["IdSAgencia", "IdTipoProducto"])
+
+    df["Monto_Ayer"] = grupo_prod["ColocacionMontoReal"].shift(1)
+    df["Ops_Ayer"] = grupo_prod["ColocacionNumReal"].shift(1)
+    df["Monto_Hace_7d"] = grupo_prod["ColocacionMontoReal"].shift(7)
+    df["Monto_Hace_14d"] = grupo_prod["ColocacionMontoReal"].shift(14)
+
+    df["Aceleracion_Semanal"] = df["Monto_Ayer"] - df["Monto_Hace_7d"]
+
+    # Ticket Promedio Histórico POR PRODUCTO
+    df["LineaBase_30d"] = grupo_prod["ColocacionMontoReal"].transform(
+        lambda x: x.shift(1).rolling(30, min_periods=1).mean()
     )
+    df["Media_Ops_30d"] = grupo_prod["ColocacionNumReal"].transform(
+        lambda x: x.shift(1).rolling(30, min_periods=1).mean()
+    )
+
+    # Si es un producto nuevo o sin ventas, asume S/ 2000 por defecto
+    df["Ticket_Promedio_30d"] = np.where(
+        df["Media_Ops_30d"] > 0, df["LineaBase_30d"] / df["Media_Ops_30d"], 2000
+    )
+
+    # 3. Contexto General de la Agencia (Presión comercial)
+    grupo_age = df.groupby(["IdSAgencia"])
+    df["Bolsa_En_Evaluacion_3d"] = grupo_age["MontoSolicitado"].transform(
+        lambda x: x.shift(1).rolling(3, min_periods=1).sum()
+    )
+    df["Repago_Ayer"] = grupo_age["RepagoReal"].shift(1)
+
+    # 4. Limpieza final de variables que causan Fuga de Datos
+    columnas_futuras = [
+        "NombreProducto",
+        "PlazoPromedioMeses",
+        "TasaPromedioTEA",
+        "ColocacionesHombres",
+        "ColocacionesMujeres",
+        "ColocacionesSociosNuevos",
+        "EdadPromedio",
+        "MontoSolicitado",
+        "CantidadSolicitudes",
+        "RepagoReal",
+        "Media_Ops_30d",
+        "ColocacionesMicro",
+        "ColocacionesMacro",
+    ]
+    df = df.drop(columns=columnas_futuras).dropna().reset_index(drop=True)
+
+    df.to_csv("src/dataset_procesado.csv", index=False)
+    logging.info(f"✅ Se procesaron {len(df)} registros a nivel Producto.")
 
 
 if __name__ == "__main__":
-    run_feature_engineering()
+    construir_features()

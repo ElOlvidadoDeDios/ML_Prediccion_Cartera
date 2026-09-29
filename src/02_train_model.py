@@ -1,125 +1,96 @@
+# src/02_train_model.py
+
 import pandas as pd
-import numpy as np
 import xgboost as xgb
-from sklearn.metrics import mean_absolute_error
-import joblib
+import pickle
 import logging
-import os
-from config import get_engine
+import numpy as np
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.metrics import mean_absolute_error, make_scorer
+from scipy import stats
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 
-def run_training():
-    logging.info("🧠 Iniciando Entrenamiento V6 (Nivel Agencia Puro)...")
-    engine = get_engine()
+def wmape_ops(y_true, y_pred):
+    y_pred_clipped = np.clip(y_pred, a_min=0, a_max=None)
+    if np.sum(y_true) == 0:
+        return 0
+    return (np.sum(np.abs(y_true - y_pred_clipped)) / np.sum(y_true)) * 100
 
-    df = pd.read_sql(
-        "SELECT * FROM ml.fct_features_entrenamiento ORDER BY Fecha", engine
+
+def entrenar_modelo():
+    logging.info("🧠 Iniciando Entrenamiento Multidimensional (Agencia + Producto)...")
+    df = pd.read_csv("src/dataset_procesado.csv")
+
+    # Purga de valores extremos de operaciones (ahora a nivel producto)
+    z_scores = np.abs(stats.zscore(df["ColocacionNumReal"]))
+    df = df[(z_scores < 3)]
+
+    # 🔥 AHORA INCLUIMOS EL PRODUCTO EN LA IA
+    df_procesado = pd.get_dummies(
+        df, columns=["IdSAgencia", "IdTipoProducto", "MesDelAnio", "DiaSemana"]
     )
-    engine.dispose()
-
-    # ¡ELIMINAMOS EL PRODUCTO DE LA AGRUPACIÓN!
-    columnas_agrupacion = [
-        "Fecha",
-        "Anio",
-        "Mes",
-        "Dia",
-        "DiaSemana",
-        "EsQuincena",
-        "EsFinDeMes",
-        "EsFeriadoNacional",
-        "EsFiestaLocal",
-        "IdSAgencia",
+    features = [
+        c
+        for c in df_procesado.columns
+        if c not in ["Fecha", "ColocacionMontoReal", "ColocacionNumReal"]
     ]
 
-    # Agrupamos toda la agencia junta
-    df_agrupado = (
-        df.groupby(columnas_agrupacion)
-        .agg(
-            {
-                "ColocacionMontoReal": "sum",
-                "AnalistasActivos": "max",  # Tomamos el máximo para no duplicar personal
-                "ExperienciaPromedioMeses": "mean",
-                "ColocacionesMicro": "sum",
-                "ColocacionesMacro": "sum",
-            }
-        )
-        .reset_index()
+    with open("src/columnas_entrenamiento.pkl", "wb") as f:
+        pickle.dump(features, f)
+
+    X = df_procesado[features]
+    y_ops = df_procesado["ColocacionNumReal"]
+
+    X_train, X_test, y_train_ops, y_test_ops = train_test_split(
+        X, y_ops, test_size=0.15, shuffle=False
     )
+    _, X_test_df = train_test_split(df_procesado, test_size=0.15, shuffle=False)
+    y_test_monto = X_test_df["ColocacionMontoReal"]
 
-    df_agrupado = df_agrupado.sort_values(by=["IdSAgencia", "Fecha"])
+    parametros = {
+        "n_estimators": [500, 800],
+        "learning_rate": [0.02, 0.05],
+        "max_depth": [4, 5],
+        "subsample": [0.85, 0.9],
+        "colsample_bytree": [0.85, 0.9],
+        "reg_alpha": [1, 2],
+        "reg_lambda": [5, 10],
+    }
 
-    # Línea base real de la agencia (Promedio de 21 días)
-    df_agrupado["LineaBase_30d"] = df_agrupado.groupby("IdSAgencia")[
-        "ColocacionMontoReal"
-    ].transform(lambda x: x.shift(1).rolling(window=21, min_periods=3).mean())
-    df_agrupado["LineaBase_30d"].fillna(0, inplace=True)
-
-    # El Ratio a predecir
-    df_agrupado["Ratio_Desempeno"] = np.where(
-        df_agrupado["LineaBase_30d"] > 0,
-        df_agrupado["ColocacionMontoReal"] / df_agrupado["LineaBase_30d"],
-        1.0,
-    )
-    # Capping anti-optimismo (La agencia no puede colocar más del doble de su promedio normal)
-    df_agrupado["Ratio_Desempeno"] = df_agrupado["Ratio_Desempeno"].clip(upper=2.0)
-
-    # Lags Operativos
-    df_agrupado["Monto_Ayer"] = df_agrupado.groupby("IdSAgencia")[
-        "ColocacionMontoReal"
-    ].shift(1)
-    df_agrupado["Tendencia_7_Dias"] = df_agrupado.groupby("IdSAgencia")[
-        "ColocacionMontoReal"
-    ].transform(lambda x: x.shift(1).rolling(window=7, min_periods=1).mean())
-    df_agrupado["Analistas_Ayer"] = df_agrupado.groupby("IdSAgencia")[
-        "AnalistasActivos"
-    ].shift(1)
-    df_agrupado["Experiencia_Ayer"] = df_agrupado.groupby("IdSAgencia")[
-        "ExperienciaPromedioMeses"
-    ].shift(1)
-    df_agrupado.fillna(0, inplace=True)
-
-    df_ml = df_agrupado[df_agrupado["LineaBase_30d"] > 0].copy()
-    df_ml = df_ml.drop(columns=["AnalistasActivos", "ExperienciaPromedioMeses"])
-
-    # Convertir Agencias a texto para el modelo
-    df_ml = pd.get_dummies(df_ml, columns=["IdSAgencia"])
-
-    X = df_ml.drop(
-        columns=[
-            "Fecha",
-            "ColocacionMontoReal",
-            "Ratio_Desempeno",
-            "LineaBase_30d",
-            "ColocacionesMicro",
-            "ColocacionesMacro",
-        ]
-    )
-    y = df_ml["Ratio_Desempeno"]
-
-    corte = int(len(df_ml) * 0.85)
-    X_train, X_test = X.iloc[:corte], X.iloc[corte:]
-    y_train, y_test = y.iloc[:corte], y.iloc[corte:]
-
-    modelo = xgb.XGBRegressor(
-        n_estimators=150,
-        learning_rate=0.05,
-        max_depth=4,
-        subsample=0.8,
-        colsample_bytree=0.8,
+    logging.info("⚙️ Entrenando IA de Operaciones por Producto...")
+    modelo_base_ops = xgb.XGBRegressor(objective="count:poisson", random_state=42)
+    torneo_ops = RandomizedSearchCV(
+        modelo_base_ops,
+        parametros,
+        n_iter=20,
+        scoring=make_scorer(wmape_ops, greater_is_better=False),
+        cv=3,
+        n_jobs=-1,
         random_state=42,
     )
-    modelo.fit(X_train, y_train)
+    torneo_ops.fit(X_train, y_train_ops)
+    mejor_modelo_ops = torneo_ops.best_estimator_
 
-    ruta_modelo = os.path.join(os.path.dirname(__file__), "modelo_xgboost.pkl")
-    ruta_columnas = os.path.join(
-        os.path.dirname(__file__), "columnas_entrenamiento.pkl"
-    )
-    joblib.dump(modelo, ruta_modelo)
-    joblib.dump(X.columns.tolist(), ruta_columnas)
-    logging.info(f"💾 Modelo Agencia-Puro V6 guardado con éxito.")
+    pred_ops = np.clip(mejor_modelo_ops.predict(X_test), 0, None)
+
+    logging.info("⚙️ Calculando Ticket Ancla Histórico por Producto...")
+    ticket_ancla = X_test_df["Ticket_Promedio_30d"]
+    monto_predicho = pred_ops * ticket_ancla
+
+    wmape_global = (
+        np.sum(np.abs(y_test_monto - monto_predicho)) / np.sum(y_test_monto)
+    ) * 100
+    mae_global = mean_absolute_error(y_test_monto, monto_predicho)
+
+    logging.info(f"   📉 Error Financiero Promedio (MAE): S/ {mae_global:,.2f}")
+    logging.info(f"   🏆 PRECISION GLOBAL MULTIDIMENSIONAL: {100 - wmape_global:.2f}%")
+
+    with open("src/modelo_ops.pkl", "wb") as f:
+        pickle.dump(mejor_modelo_ops, f)
+    logging.info("💾 Modelo Corporativo guardado con éxito.")
 
 
 if __name__ == "__main__":
-    run_training()
+    entrenar_modelo()

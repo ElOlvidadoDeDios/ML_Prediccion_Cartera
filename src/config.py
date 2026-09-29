@@ -1,16 +1,21 @@
+# src/config
+
 import os
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
 
-# Cargar variables de entorno
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+# Cargar variables del .env
+load_dotenv()
 
+# Origen (Nube)
+ORIGEN_SERVER = os.getenv("DB_TRANSACMIF_SERVER")
+ORIGEN_DB = os.getenv("DB_TRANSACMIF_NAME")
+ORIGEN_USER = os.getenv("DB_TRANSACMIF_USER")
+ORIGEN_PASS = os.getenv("DB_TRANSACMIF_PASS")
 
-def get_engine():
-    server = os.getenv("DB_SERVER")
-    database = os.getenv("DB_DATABASE")
+# Destino (Local)
+DESTINO_SERVER = os.getenv("DB_DWH_SERVER")
+DESTINO_DB = os.getenv("DB_DWH_NAME")
 
-    # Ajusta esto si usas usuario/contraseña en vez de Trusted_Connection
-    conn_str = f"mssql+pyodbc://@{server}/{database}?driver=ODBC+Driver+17+for+SQL+Server&Trusted_Connection=yes"
-    return create_engine(conn_str)
+# Cadenas de conexión
+STR_CONN_ORIGEN = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={ORIGEN_SERVER};DATABASE={ORIGEN_DB};UID={ORIGEN_USER};PWD={ORIGEN_PASS}"
+STR_CONN_DESTINO = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={DESTINO_SERVER};DATABASE={DESTINO_DB};Trusted_Connection=yes"
