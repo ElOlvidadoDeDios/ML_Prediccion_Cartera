@@ -135,7 +135,13 @@ def predecir_manana():
     # Cálculo base
     predicciones_dinero = prediccion_operaciones * ticket_ancla * factor_estacional
 
-    # Domingos NO SE TRABAJA (Cero rotundo)
+    # RED DE SEGURIDAD (Para agencias que no registran solicitudes a tiempo)
+    # Si la probabilidad dio casi cero, pero el ticket promedio es alto, asignamos un piso mínimo logístico
+    # equivalente al 5% del valor de un crédito normal para no arrojar "5 soles".
+    piso_minimo = ticket_ancla * 0.05
+    predicciones_dinero = np.maximum(predicciones_dinero, piso_minimo)
+
+    # Domingos NO SE TRABAJA (Cero rotundo, este sí pisa la red de seguridad)
     predicciones_dinero = np.where(df_ultimo["EsDomingo"] == 1, 0, predicciones_dinero)
 
     logging.info("🧠 Generando explicaciones de la IA para Gerencia...")
