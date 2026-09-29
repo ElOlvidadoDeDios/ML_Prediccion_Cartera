@@ -79,6 +79,7 @@ def entrenar_modelo():
     ticket_ancla = X_test_df["Ticket_Promedio_30d"]
     monto_predicho = pred_ops * ticket_ancla
 
+    # Agrupamos la realidad y la predicción POR AGENCIA Y FECHA para ver el error real del negocio
     wmape_global = (
         np.sum(np.abs(y_test_monto - monto_predicho)) / np.sum(y_test_monto)
     ) * 100

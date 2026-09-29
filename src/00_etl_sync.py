@@ -82,10 +82,12 @@ def extraer_lote(fecha_inicio, fecha_fin):
         SELECT 
             CAST(FECHA_SOL AS DATE) AS Fecha, 
             COD_AGE AS IdSAgencia_Req, 
-            SUM(MONTO_SOL) AS MontoSolicitado, COUNT(NRO_SOL) AS CantidadSolicitudes
+            TIPO_PROD AS IdTipoProducto_Req, -- 🔥 NUEVO: Separar por producto
+            SUM(MONTO_SOL) AS MontoSolicitado, 
+            COUNT(NRO_SOL) AS CantidadSolicitudes
         FROM TRANSACMIF.dbo.PRESOL WITH(NOLOCK)
         WHERE FECHA_SOL >= '{fecha_inicio}' AND FECHA_SOL < '{fecha_fin}'
-        GROUP BY CAST(FECHA_SOL AS DATE), COD_AGE
+        GROUP BY CAST(FECHA_SOL AS DATE), COD_AGE, TIPO_PROD
     ),
     -- 🔥 NUEVO: CTE DE REPAGOS (Basado en gc_repago_cpp) 🔥
     CTE_REPAGOS AS (
@@ -157,7 +159,10 @@ def extraer_lote(fecha_inicio, fecha_fin):
         ISNULL(R.CantidadSolicitudes, 0) AS CantidadSolicitudes,
         ISNULL(RP.RepagoReal, 0) AS RepagoReal
     FROM CTE_FINAL F
-    LEFT JOIN CTE_REQUERIMIENTOS R ON F.Fecha = R.Fecha AND F.IdSAgencia = R.IdSAgencia_Req
+    LEFT JOIN CTE_REQUERIMIENTOS R 
+        ON F.Fecha = R.Fecha 
+        AND F.IdSAgencia = R.IdSAgencia_Req 
+        AND F.IdTipoProducto = R.IdTipoProducto_Req -- 🔥 NUEVO: Cruce exacto
     LEFT JOIN CTE_REPAGOS RP ON F.Fecha = RP.Fecha AND F.IdSAgencia = RP.IdSAgencia_Rep
     """
     df_lote = pd.read_sql(query, conn)

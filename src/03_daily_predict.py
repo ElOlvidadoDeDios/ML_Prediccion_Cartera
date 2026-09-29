@@ -39,7 +39,7 @@ def obtener_nombre_legible(feature_name):
 
 
 def predecir_manana():
-    logging.info("🔮 Iniciando Predicción Explicable (Redondeada a la Realidad)...")
+    logging.info("🔮 Iniciando Predicción Explicable (Corregida)...")
 
     try:
         with open("src/modelo_ops.pkl", "rb") as f:
@@ -61,6 +61,9 @@ def predecir_manana():
         pd.to_datetime(fecha_env)
         if fecha_env
         else pd.to_datetime(datetime.now().date())
+    )
+    logging.info(
+        f"📅 GENERANDO PREDICCIONES PARA EL DÍA: {fecha_objetivo.strftime('%Y-%m-%d')}"
     )
 
     idx_ultimos = df.groupby(["IdSAgencia", "IdTipoProducto"])["Fecha"].idxmax()
@@ -85,26 +88,62 @@ def predecir_manana():
     )
     df_ultimo["EsDomingo"] = (df_ultimo["DiaSemana"] == 6).astype(int)
 
-    df_ultimo["Monto_Ayer"] = df_ultimo["ColocacionMontoReal"]
-    df_ultimo["Ops_Ayer"] = df_ultimo["ColocacionNumReal"]
+    # 🔥 EL EXORCISMO DEL EFECTO FANTASMA 🔥
+    # Calculamos cuántos días han pasado desde la última vez que este producto se vendió.
+    dias_desfase = (fecha_objetivo - df_ultimo["Fecha"]).dt.days
+
+    # Si la fila es vieja, sus solicitudes pasadas YA NO EXISTEN HOY. Todo a CERO.
+    df_ultimo["Monto_Ayer"] = np.where(
+        dias_desfase == 1, df_ultimo["ColocacionMontoReal"], 0
+    )
+    df_ultimo["Ops_Ayer"] = np.where(
+        dias_desfase == 1, df_ultimo["ColocacionNumReal"], 0
+    )
+
+    df_ultimo["Bolsa_En_Evaluacion_3d"] = np.where(
+        dias_desfase <= 3, df_ultimo["Bolsa_En_Evaluacion_3d"], 0
+    )
+    df_ultimo["Monto_Solicitado_7d"] = np.where(
+        dias_desfase <= 7, df_ultimo["Monto_Solicitado_7d"], 0
+    )
+    df_ultimo["Monto_Solicitado_14d"] = np.where(
+        dias_desfase <= 14, df_ultimo["Monto_Solicitado_14d"], 0
+    )
+    df_ultimo["Monto_Solicitado_21d"] = np.where(
+        dias_desfase <= 21, df_ultimo["Monto_Solicitado_21d"], 0
+    )
+
+    df_ultimo["Aceleracion_Semanal"] = np.where(
+        dias_desfase <= 7, df_ultimo["Aceleracion_Semanal"], 0
+    )
 
     X_pred_raw = pd.get_dummies(
         df_ultimo, columns=["IdSAgencia", "IdTipoProducto", "MesDelAnio", "DiaSemana"]
     )
     X_pred = X_pred_raw.reindex(columns=columnas_modelo, fill_value=0)
 
-    # 🔥 LA MAGIA ESTÁ AQUÍ: np.round() 🔥
-    # Redondeamos las operaciones. Si la IA dice 0.4 créditos de Hipotecario, se vuelve 0.
-    # Así matamos los "montos fantasma".
-    prediccion_operaciones = np.round(np.clip(modelo_ops.predict(X_pred), 0, None))
-
+    # 🔥 MAGIA RESTAURADA 🔥
+    # Redondeamos las operaciones para evitar que la IA desembolse "0.2 créditos"
+    # Usamos la esperanza matemática exacta, sin redondear a cero.
+    prediccion_operaciones = np.clip(modelo_ops.predict(X_pred), 0, None)
     ticket_ancla = df_ultimo["Ticket_Promedio_30d"]
+
+    # === TUS REGLAS DE NEGOCIO ===
+    factor_estacional = np.ones(len(df_ultimo))
+
+    # 1. Sábados (Medio día de trabajo -> castigamos la capacidad al 60%)
+    factor_estacional = np.where(df_ultimo["DiaSemana"] == 5, 0.60, factor_estacional)
+
+    # 2. Cierre de mes (Horario extendido hasta 8pm -> bonificación del 35%)
     factor_estacional = np.where(
-        (df_ultimo["Fiebre_Cierre"] == 1) | (df_ultimo["EsQuincena"] == 1), 1.15, 1.0
+        df_ultimo["Fiebre_Cierre"] == 1, factor_estacional * 1.35, factor_estacional
     )
 
-    # Solo habrá dinero si las operaciones redondeadas son 1, 2, 3...
-    predicciones_dinero = prediccion_operaciones * (ticket_ancla * factor_estacional)
+    # Multiplicamos: Probabilidad * Ticket * Multiplicador de Horario
+    predicciones_dinero = prediccion_operaciones * ticket_ancla * factor_estacional
+
+    # 3. Domingos NO SE TRABAJA (Filtro absoluto a CERO)
+    predicciones_dinero = np.where(df_ultimo["EsDomingo"] == 1, 0, predicciones_dinero)
 
     logging.info("🧠 Generando explicaciones de la IA para Gerencia...")
     explainer = shap.TreeExplainer(modelo_ops)
@@ -169,13 +208,13 @@ def predecir_manana():
         resumen_consola = (
             resultados.groupby("IdSAgencia")["Prediccion_Diaria"].sum().reset_index()
         )
-        resumen_consola["Predicción de HOY"] = resumen_consola[
-            "Prediccion_Diaria"
-        ].apply(lambda x: f"S/ {x:,.2f}")
-        print("\n--- PREDICCIÓN EXPLICADA Y CONSOLIDADA (REDONDEADA) ---")
-        print(
-            resumen_consola[["IdSAgencia", "Predicción de HOY"]].to_string(index=False)
+        columna_dinamica = f"Predicción para {fecha_str}"
+        resumen_consola[columna_dinamica] = resumen_consola["Prediccion_Diaria"].apply(
+            lambda x: f"S/ {x:,.2f}"
         )
+
+        print("\n--- PREDICCIÓN EXPLICADA Y CONSOLIDADA ---")
+        print(resumen_consola[["IdSAgencia", columna_dinamica]].to_string(index=False))
 
         logging.info("✅ ¡Proyección Explicada guardada en SQL con éxito!")
     except Exception as e:
