@@ -17,13 +17,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 TRADUCTOR_VARIABLES = {
     "Fiebre_Cierre": "Presión Cierre de Mes",
     "EsQuincena": "Efecto Quincena",
-    "Bolsa_En_Evaluacion_3d": "Solicitudes en Trámite",
+    "Ritmo_Ops_7d": "Ritmo de Ventas Reciente",
+    "Ritmo_Ops_30d": "Tendencia Mensual del Producto",
+    "Bolsa_En_Evaluacion_3d": "Mega-Créditos en Trámite",
     "Monto_Ayer": "Colocación del Día Anterior",
-    "Ticket_Promedio_30d": "Ticket Histórico del Producto",
-    "EsDomingo": "Día No Laborable (Domingo)",
-    "EsFeriadoNacional": "Feriado Nacional",
-    "EsFiestaLocal": "Festividad Local",
-    "Aceleracion_Semanal": "Racha Comercial Semanal",
+    "Ticket_Promedio_30d": "Ticket Histórico",
+    "EsDomingo": "Día No Laborable",
 }
 
 
@@ -34,12 +33,12 @@ def obtener_nombre_legible(feature_name):
     if "IdTipoProducto_" in feature_name:
         return "Naturaleza del Producto"
     if "IdSAgencia_" in feature_name:
-        return "Historial de la Agencia"
+        return "Comportamiento de Agencia"
     return feature_name
 
 
 def predecir_manana():
-    logging.info("🔮 Iniciando Predicción Explicable (Con Reglas de Negocio V2)...")
+    logging.info("🔮 Iniciando Predicción (Modelo Ritmo Flash)...")
 
     try:
         with open("src/modelo_ops.pkl", "rb") as f:
@@ -62,7 +61,6 @@ def predecir_manana():
         if fecha_env
         else pd.to_datetime(datetime.now().date())
     )
-
     logging.info(
         f"📅 GENERANDO PREDICCIONES PARA EL DÍA: {fecha_objetivo.strftime('%Y-%m-%d')}"
     )
@@ -89,7 +87,7 @@ def predecir_manana():
     )
     df_ultimo["EsDomingo"] = (df_ultimo["DiaSemana"] == 6).astype(int)
 
-    # EL EXORCISMO DEL EFECTO FANTASMA
+    # 🔥 LIMPIEZA DE MEMORIA FANTASMA 🔥
     dias_desfase = (fecha_objetivo - df_ultimo["Fecha"]).dt.days
 
     df_ultimo["Monto_Ayer"] = np.where(
@@ -99,17 +97,22 @@ def predecir_manana():
         dias_desfase == 1, df_ultimo["ColocacionNumReal"], 0
     )
 
+    # Apagamos los ritmos si el producto lleva muerto más días que su propia ventana de medición
+    df_ultimo["Ritmo_Ops_7d"] = np.where(
+        dias_desfase <= 7, df_ultimo["Ritmo_Ops_7d"], 0
+    )
+    df_ultimo["Ritmo_Ops_14d"] = np.where(
+        dias_desfase <= 14, df_ultimo["Ritmo_Ops_14d"], 0
+    )
+    df_ultimo["Ritmo_Ops_30d"] = np.where(
+        dias_desfase <= 30, df_ultimo["Ritmo_Ops_30d"], 0
+    )
+
     df_ultimo["Bolsa_En_Evaluacion_3d"] = np.where(
         dias_desfase <= 3, df_ultimo["Bolsa_En_Evaluacion_3d"], 0
     )
     df_ultimo["Monto_Solicitado_7d"] = np.where(
         dias_desfase <= 7, df_ultimo["Monto_Solicitado_7d"], 0
-    )
-    df_ultimo["Monto_Solicitado_14d"] = np.where(
-        dias_desfase <= 14, df_ultimo["Monto_Solicitado_14d"], 0
-    )
-    df_ultimo["Monto_Solicitado_21d"] = np.where(
-        dias_desfase <= 21, df_ultimo["Monto_Solicitado_21d"], 0
     )
     df_ultimo["Aceleracion_Semanal"] = np.where(
         dias_desfase <= 7, df_ultimo["Aceleracion_Semanal"], 0
@@ -120,28 +123,24 @@ def predecir_manana():
     )
     X_pred = X_pred_raw.reindex(columns=columnas_modelo, fill_value=0)
 
-    # ESPERANZA MATEMÁTICA REAL
     prediccion_operaciones = np.clip(modelo_ops.predict(X_pred), 0, None)
     ticket_ancla = df_ultimo["Ticket_Promedio_30d"]
 
-    # === TUS REGLAS DE NEGOCIO ===
+    # REGLAS DE NEGOCIO
     factor_estacional = np.ones(len(df_ultimo))
-
-    # Cierre de mes: Trabajan hasta las 8 PM (2 horas extra = ~25% más de capacidad + fiebre comercial)
+    factor_estacional = np.where(df_ultimo["DiaSemana"] == 5, 0.50, factor_estacional)
     factor_estacional = np.where(
         df_ultimo["Fiebre_Cierre"] == 1, factor_estacional * 1.35, factor_estacional
     )
 
-    # Cálculo base
     predicciones_dinero = prediccion_operaciones * ticket_ancla * factor_estacional
 
-    # RED DE SEGURIDAD (Para agencias que no registran solicitudes a tiempo)
-    # Si la probabilidad dio casi cero, pero el ticket promedio es alto, asignamos un piso mínimo logístico
-    # equivalente al 5% del valor de un crédito normal para no arrojar "5 soles".
+    # RED DE SEGURIDAD (Evita predicciones de 5 soles. Si el modelo arroja algo > 0, asume al menos el 5% de un ticket)
     piso_minimo = ticket_ancla * 0.05
-    predicciones_dinero = np.maximum(predicciones_dinero, piso_minimo)
+    predicciones_dinero = np.where(
+        predicciones_dinero > 0, np.maximum(predicciones_dinero, piso_minimo), 0
+    )
 
-    # Domingos NO SE TRABAJA (Cero rotundo, este sí pisa la red de seguridad)
     predicciones_dinero = np.where(df_ultimo["EsDomingo"] == 1, 0, predicciones_dinero)
 
     logging.info("🧠 Generando explicaciones de la IA para Gerencia...")
@@ -177,9 +176,6 @@ def predecir_manana():
         cursor = conn.cursor()
         fecha_str = fecha_objetivo.strftime("%Y-%m-%d")
 
-        logging.info(
-            f"🧹 Purgando proyecciones previas del {fecha_str} para evitar duplicidad..."
-        )
         cursor.execute(
             f"DELETE FROM [ml].[fct_predicciones_diarias] WHERE CAST(Fecha AS DATE) = CAST('{fecha_str}' AS DATE)"
         )
